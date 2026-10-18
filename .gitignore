@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Outputs live as Release assets, never in git:
+latest.json
+archive/
+

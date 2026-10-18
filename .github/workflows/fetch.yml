@@ -1,0 +1,61 @@
+name: Fetch arXiv listings
+
+# Publishes the day's listings as assets of ONE GitHub Release (tag "listings").
+# Nothing is ever committed: the repo's history stays exactly as you pushed it.
+
+on:
+  schedule:
+    # GitHub cron is UTC. arXiv announces at 20:00 US Eastern
+    # (00:00 UTC in summer time, 01:00 UTC in winter time).
+    - cron: "5 1 * * 1-5"    # 06:35 IST, main run
+    - cron: "25 1 * * 1-5"   # 06:55 IST, backup (does nothing if 06:35 succeeded)
+  workflow_dispatch: {}      # "Run workflow" button for manual tests
+
+permissions:
+  contents: write   # needed to create the release and upload assets (no commits)
+  actions: write    # needed for the keep-alive step below
+
+concurrency:
+  group: fetch-arxiv
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG: listings
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure the release exists and fetch the previous latest.json
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "arXiv listings" --latest=false \
+              --notes "Daily arXiv listings as JSON assets. latest.json is replaced every weekday; YYYY-MM-DD.json are the dated copies. Produced by .github/workflows/fetch.yml; no commits are made."
+          fi
+          gh release download "$TAG" --pattern latest.json --dir . --clobber || true
+
+      - name: Download listings
+        run: python fetch_arxiv.py
+
+      - name: Upload latest.json and today's dated copy
+        run: |
+          gh release upload "$TAG" latest.json --clobber
+          for f in archive/*.json; do
+            [ -e "$f" ] && gh release upload "$TAG" "$f" --clobber
+          done
+          echo "status=$(jq -r .status latest.json) listing_date=$(jq -r .listing_date latest.json) papers=$(jq -r .counts.total latest.json)"
+
+      # GitHub pauses scheduled workflows in public repos after 60 days without
+      # repository activity. Since this workflow makes no commits, re-enable it
+      # on every run (harmless if already enabled).
+      - name: Keep the schedule alive
+        if: always()
+        run: gh workflow enable fetch.yml || true

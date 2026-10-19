@@ -7,9 +7,13 @@ on:
   schedule:
     # GitHub cron is UTC. arXiv announces at 20:00 US Eastern
     # (00:00 UTC in summer time, 01:00 UTC in winter time).
-    - cron: "5 1 * * 1-5"    # 06:35 IST, main run
-    - cron: "25 1 * * 1-5"   # 06:55 IST, backup (does nothing if 06:35 succeeded)
-  workflow_dispatch: {}      # "Run workflow" button for manual tests
+    # GitHub's scheduler can delay or drop runs, so try every 10 minutes
+    # from 05:30 to 08:20 IST (00:00-02:50 UTC). Once a run has today's
+    # good listing, every later run exits within seconds without contacting arXiv.
+    - cron: "*/10 0-2 * * 1-5"
+  # Primary trigger: an external timer (cron-job.org) calls GitHub's API at
+  # 06:36, 06:50 and 07:05 IST, which starts this same workflow_dispatch event.
+  workflow_dispatch: {}      # also the "Run workflow" button
 
 permissions:
   contents: write   # needed to create the release and upload assets (no commits)

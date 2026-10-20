@@ -109,6 +109,39 @@ class RssTest(unittest.TestCase):
         self.assertEqual(papers[0]["categories"], ["astro-ph.CO", "gr-qc"])
 
 
+class StaleCacheTest(unittest.TestCase):
+    """20 Oct 2026: one address served Monday's cached page, a browser saw Tuesday's."""
+
+    def setUp(self):
+        self._fetch, self._sleep = fa.fetch, fa.time.sleep
+        fa.time.sleep = lambda s: None
+        monday = HTML_SAMPLE.replace(b"Thursday, 15 October 2026", b"Monday, 19 October 2026")
+        tuesday = HTML_SAMPLE.replace(b"Thursday, 15 October 2026", b"Tuesday, 20 October 2026")
+        self.calls = []
+
+        def fake_fetch(url, retry=True):
+            self.calls.append(url)
+            return 200, (tuesday if url.startswith("https://export.arxiv.org") else monday)
+        fa.fetch = fake_fetch
+
+    def tearDown(self):
+        fa.fetch, fa.time.sleep = self._fetch, self._sleep
+
+    def test_newest_copy_wins(self):
+        info, kept = fa.get_category("astro-ph.CO", "2026-10-20")
+        self.assertEqual(info["date"], "2026-10-20")
+        self.assertEqual(info["variant"], 1)               # export.arxiv.org
+        self.assertEqual(len(self.calls), 2)               # stopped once today's copy arrived
+        self.assertEqual([t["date"] for t in info["tried"]], ["2026-10-19", "2026-10-20"])
+        self.assertEqual(len(kept), 2)                     # new + cross, replacement dropped
+
+    def test_all_stale_keeps_newest(self):
+        fa.fetch = lambda url, retry=True: (self.calls.append(url) or (200, HTML_SAMPLE))
+        info, _ = fa.get_category("astro-ph.CO", "2026-10-20")
+        self.assertEqual(info["date"], "2026-10-15")
+        self.assertEqual(len(self.calls), len(fa.HTML_URLS))
+
+
 if __name__ == "__main__":
     unittest.main()
 

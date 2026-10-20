@@ -5,9 +5,13 @@ Plain Python, standard library only. Runs in GitHub Actions; no API keys.
 
 Sources, per category
 ---------------------
-1. https://arxiv.org/list/<cat>/new?skip=0&show=2000   (primary)
+1. The category's "new" page (primary), tried at several addresses:
+   https://arxiv.org/list/<cat>/new, https://export.arxiv.org/list/<cat>/new,
+   a unique never-cached address, and .../new?skip=0&show=2000.
    Updated at each announcement (20:00 US Eastern = 05:30 IST in summer
-   time, 06:30 IST in winter time), with full abstracts.
+   time, 06:30 IST in winter time), with full abstracts. arXiv's cache can
+   keep serving yesterday's copy of one address for hours (seen on
+   20 Oct 2026), so the newest copy wins.
 2. https://rss.arxiv.org/rss/<cat>                     (fallback)
    Only used if the HTML page cannot be fetched or parsed. NOTE: arXiv
    regenerates RSS at midnight US Eastern (~09:30-10:30 IST), so in the
@@ -63,7 +67,17 @@ CATEGORIES = [
     "astro-ph.IM",
 ]
 KEEP_TYPES = {"new", "cross"}          # skip replacements
-HTML_URL = "https://arxiv.org/list/{cat}/new?skip=0&show=2000"
+# The same listing page at several addresses. On 20 Oct 2026 GitHub's runners
+# kept receiving Monday's cached copy of ".../new?skip=0&show=2000" until at
+# least 09:30 IST, while a browser opening ".../new" saw Tuesday's listing.
+# Each category tries these in order and stops at the first copy dated today;
+# otherwise the newest copy is kept. "tried" in latest.json shows what each gave.
+HTML_URLS = [
+    "https://arxiv.org/list/{cat}/new",                                   # what a browser opens
+    "https://export.arxiv.org/list/{cat}/new",                            # arXiv's host for scripts
+    "https://arxiv.org/list/{cat}/new?skip=0&show=2000&nocache={stamp}",  # unique: cannot be cached
+    "https://arxiv.org/list/{cat}/new?skip=0&show=2000",                  # the address used until v5
+]
 FEED_URL = "https://rss.arxiv.org/rss/{cat}"
 USER_AGENT = "arxiv-listings/1.1 (+https://github.com/PhysicistSouravDas/arxiv-listings)"
 SPACING_S = 5                          # pause between requests
@@ -86,15 +100,19 @@ def strip_tags(fragment: str) -> str:
     return clean(html.unescape(re.sub(r"<[^>]+>", " ", fragment or "")))
 
 
-def fetch(url: str) -> tuple[int, bytes]:
-    """GET with retries and backoff. Returns (http_status, body)."""
+def fetch(url: str, retry: bool = True) -> tuple[int, bytes]:
+    """GET with retries and backoff (one attempt if retry=False). Returns (http_status, body)."""
     last_err: Exception | None = None
-    for attempt, wait in enumerate([0] + RETRY_WAITS_S):
+    for attempt, wait in enumerate([0] + (RETRY_WAITS_S if retry else [])):
         if wait:
             print(f"  retry {attempt} in {wait}s ({last_err})", flush=True)
             time.sleep(wait)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={
+                "User-Agent": USER_AGENT,
+                "Cache-Control": "no-cache",   # ask caches for a fresh copy
+                "Pragma": "no-cache",
+            })
             with urllib.request.urlopen(req, timeout=60) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
@@ -240,17 +258,41 @@ def parse_feed(xml_bytes: bytes, cat: str) -> tuple[str | None, list[dict]]:
 
 
 # -------------------------------------------------------------------- main
-def get_category(cat: str) -> tuple[dict, list[dict]]:
-    """Try HTML, then RSS. Returns (info, kept papers)."""
-    info = {"source": None, "http": 0, "date": None, "new": 0, "cross": 0}
-    code, body = fetch(HTML_URL.format(cat=cat))
-    info["http"] = code
-    date, papers = (None, [])
-    if code == 200 and body:
-        date, papers = parse_html(body, cat)
+def get_html(cat: str, expected: str, order: list[int], limit: int) -> tuple[dict, list[dict]]:
+    """Try up to `limit` addresses of the category's "new" page, in `order`.
+    Stops at the first copy dated `expected`; otherwise keeps the newest copy."""
+    best = {"variant": None, "http": 0, "date": None, "papers": []}
+    tried = []
+    stamp = int(time.time())
+    for n, k in enumerate(order[:limit]):
+        if n:
+            time.sleep(SPACING_S)
+        url = HTML_URLS[k].format(cat=cat, stamp=stamp)
+        code, body = fetch(url, retry=(n == 0))
+        date, papers = parse_html(body, cat) if code == 200 and body else (None, [])
+        tried.append({"url": url, "http": code, "date": date, "entries": len(papers)})
+        print(f"  [{k}] {url} -> http={code} date={date} entries={len(papers)}", flush=True)
+        if best["variant"] is None or (date or "", len(papers)) > (best["date"] or "", len(best["papers"])):
+            best = {"variant": k, "http": code, "date": date, "papers": papers}
+        if date == expected:
+            break
+    best["tried"] = tried
+    return best, best.pop("papers")
+
+
+def get_category(cat: str, expected: str, order: list[int] | None = None,
+                 limit: int | None = None) -> tuple[dict, list[dict]]:
+    """Try the HTML page's addresses, then RSS. Returns (info, kept papers)."""
+    order = order if order is not None else list(range(len(HTML_URLS)))
+    limit = limit if limit is not None else len(order)
+    best, papers = get_html(cat, expected, order, limit)
+    info = {"source": None, "http": best["http"], "date": None, "new": 0, "cross": 0,
+            "variant": best["variant"], "tried": best["tried"]}
+    date = best["date"]
+    if best["http"] == 200 and (date or papers):
         info["source"] = "html"
     if not date or not papers:
-        if code == 200 and info["source"] == "html" and date and not papers:
+        if info["source"] == "html" and date and not papers:
             pass   # a dated page with no entries: genuinely empty, keep it
         else:
             print(f"  HTML gave date={date} papers={len(papers)}; trying RSS", flush=True)
@@ -284,12 +326,22 @@ def main() -> int:
 
     cat_info: dict[str, dict] = {}
     per_cat: dict[str, list[dict]] = {}
+    # The first category tries every address. Later ones start with the address
+    # that worked; if none gave today's copy (e.g. before the announcement),
+    # later categories try only one address, to keep requests to arXiv low.
+    order = list(range(len(HTML_URLS)))
+    limit = len(order)
     for i, cat in enumerate(CATEGORIES):
         if i:
             time.sleep(SPACING_S)
         print(f"Fetching {cat} ...", flush=True)
-        info, kept = get_category(cat)
+        info, kept = get_category(cat, expected, order, limit)
         info["fresh"] = info["date"] == expected
+        if info["fresh"] and info["source"] == "html":
+            order = [info["variant"]] + [k for k in order if k != info["variant"]]
+            limit = len(order)
+        elif i == 0:
+            limit = 1
         cat_info[cat], per_cat[cat] = info, kept
         print(f"  source={info['source']} http={info['http']} date={info['date']} "
               f"new={info['new']} cross={info['cross']} fresh={info['fresh']}", flush=True)
